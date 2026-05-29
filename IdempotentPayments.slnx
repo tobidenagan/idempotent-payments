@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="docker-compose.dcproj">
+    <Build />
+  </Project>
+  <Project Path="IdempotentPayments.Api/IdempotentPayments.Api.csproj" />
+  <Project Path="IdempotentPayments.Tests/IdempotentPayments.Tests.csproj" />
+</Solution>
