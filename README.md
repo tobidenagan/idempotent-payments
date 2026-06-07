@@ -13,6 +13,9 @@ The goal of this project is educational: show the production correctness ideas b
 - Transactional payment creation
 - Duplicate request replay
 - Conflict handling when an idempotency key is reused with a different payload
+- Wallet debit double-spend prevention
+- Immutable ledger entries
+- Atomic conditional balance updates
 
 ## Project Structure
 
@@ -28,15 +31,19 @@ IdempotentPayments.Api/
 IdempotentPayments.Tests/
   PaymentValidationTests.cs
   PaymentApiTests.cs
+  WalletApiTests.cs
 ```
 
-The most important file to study is:
+The most important files to study are:
 
 ```text
 IdempotentPayments.Api/Data/PaymentRepository.cs
+IdempotentPayments.Api/Data/WalletRepository.cs
 ```
 
-That is where the idempotency row, payment row, stored response, unique constraint, and transaction all come together.
+`PaymentRepository.cs` shows durable payment idempotency.
+
+`WalletRepository.cs` shows wallet balance updates, ledger inserts, debit idempotency, and double-spend prevention.
 
 ## Run With Docker
 
@@ -63,7 +70,7 @@ Create a payment:
 ```powershell
 curl -X POST http://localhost:8080/payments `
   -H "Content-Type: application/json" `
-  -d "{\"amount\":5000,\"currency\":\"NGN\",\"customerId\":\"cust_123\",\"idempotencyKey\":\"abc-123\"}"
+  -d "{\"amount\":5000,\"currency\":\"USD\",\"customerId\":\"cust_123\",\"idempotencyKey\":\"abc-123\"}"
 ```
 
 Send the exact same request again. You should get the same payment response instead of a second payment.
@@ -132,7 +139,7 @@ Content-Type: application/json
 ```json
 {
   "amount": 5000,
-  "currency": "NGN",
+  "currency": "USD",
   "customerId": "cust_123",
   "idempotencyKey": "abc-123"
 }
@@ -145,10 +152,34 @@ Successful response:
   "paymentId": "pay_...",
   "status": "Pending",
   "amount": 5000,
-  "currency": "NGN",
+  "currency": "USD",
   "customerId": "cust_123"
 }
 ```
+
+## Wallet Debit Demo
+
+The project also includes a wallet debit flow that demonstrates double-spend prevention.
+
+First fund a demo wallet:
+
+```powershell
+curl -X POST http://localhost:8080/wallets/cust_123/credits `
+  -H "Content-Type: application/json" `
+  -d "{\"amount\":10000,\"currency\":\"USD\",\"reference\":\"fund_001\"}"
+```
+
+Then debit the wallet:
+
+```powershell
+curl -X POST http://localhost:8080/wallets/cust_123/debits `
+  -H "Content-Type: application/json" `
+  -d "{\"amount\":8000,\"currency\":\"USD\",\"reference\":\"order_123\",\"idempotencyKey\":\"debit_abc\"}"
+```
+
+Send the exact same debit again. You should get the same stored debit response.
+
+Send two different `8000 USD` debit requests against a `10000 USD` balance at the same time. Only one should succeed; the other should fail with insufficient funds.
 
 ## Idempotency Rules
 
@@ -157,6 +188,24 @@ Successful response:
 - Same key with a different payload returns `409 Conflict`.
 - PostgreSQL is the source of truth for idempotency data.
 - The database unique constraint protects against concurrent duplicate requests.
+
+## Wallet Correctness Rules
+
+- Wallet balance is a mutable snapshot for fast reads.
+- Ledger entries are immutable records of money movement.
+- Debits use an atomic conditional update:
+
+```sql
+update wallets
+set balance = balance - @amount
+where id = @wallet_id
+  and balance >= @amount
+returning balance;
+```
+
+- If the update returns no row, the debit failed because the wallet had insufficient funds at the moment of update.
+- Wallet update and ledger insert happen in the same transaction.
+- Debit attempts are idempotent, including insufficient-funds outcomes.
 
 ## Tests
 
@@ -173,7 +222,7 @@ Run tests:
 dotnet test .\IdempotentPayments.Tests\IdempotentPayments.Tests.csproj --no-build
 ```
 
-The integration tests in `PaymentApiTests.cs` require Docker because Testcontainers starts a temporary PostgreSQL container for the test run. Make sure Docker Desktop is running before executing `dotnet test`.
+The integration tests in `PaymentApiTests.cs` and `WalletApiTests.cs` require Docker because Testcontainers starts a temporary PostgreSQL container for the test run. Make sure Docker Desktop is running before executing `dotnet test`.
 
 ## Learning Path
 
@@ -183,4 +232,7 @@ Read these in order:
 2. `IdempotentPayments.Api/Endpoints/PaymentEndpoints.cs`
 3. `IdempotentPayments.Api/Services/PaymentService.cs`
 4. `IdempotentPayments.Api/Data/PaymentRepository.cs`
-5. `IdempotentPayments.Tests/PaymentApiTests.cs`
+5. `IdempotentPayments.Api/Services/WalletService.cs`
+6. `IdempotentPayments.Api/Data/WalletRepository.cs`
+7. `IdempotentPayments.Tests/PaymentApiTests.cs`
+8. `IdempotentPayments.Tests/WalletApiTests.cs`

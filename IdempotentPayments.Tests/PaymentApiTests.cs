@@ -58,7 +58,7 @@ public sealed class PaymentApiTests : IAsyncLifetime
         Assert.StartsWith("pay_", body.PaymentId);
         Assert.Equal("Pending", body.Status);
         Assert.Equal(5000, body.Amount);
-        Assert.Equal("NGN", body.Currency);
+        Assert.Equal("USD", body.Currency);
         Assert.Equal("cust_123", body.CustomerId);
     }
 
@@ -113,7 +113,7 @@ public sealed class PaymentApiTests : IAsyncLifetime
     }
 
     private static CreatePaymentRequest NewRequest(string idempotencyKey) =>
-        new(5000, "NGN", "cust_123", idempotencyKey);
+        new(5000, "USD", "cust_123", idempotencyKey);
 
     private sealed record CreatePaymentRequest(
         long Amount,

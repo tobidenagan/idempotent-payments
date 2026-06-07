@@ -61,3 +61,30 @@ If the server fails before the transaction commits, PostgreSQL rolls back the id
 - Add reconciliation jobs that compare payment records with provider/bank state.
 - Add rate limits to protect the endpoint from retry storms.
 - Add OpenTelemetry traces and metrics for latency, duplicate requests, conflicts, and database errors.
+
+## Wallet debit correctness
+
+The wallet module adds a second finance-grade lesson: preventing double spend.
+
+The project stores current balance in `wallets` and immutable money movement history in `ledger_entries`.
+
+For debits, the code uses an atomic conditional update:
+
+```sql
+update wallets
+set balance = balance - @amount,
+    updated_at = now()
+where id = @wallet_id
+  and balance >= @amount
+returning balance;
+```
+
+This keeps the balance check and deduction in one database statement. If two `8000 USD` debits race against a `10000 USD` balance, one update can succeed and the other returns no row.
+
+The debit flow also writes a ledger entry in the same transaction. This prevents bad states such as balance changed without a ledger entry, or a ledger entry existing without the balance change.
+
+Debit idempotency follows the same model as payment idempotency:
+
+- same key and same payload replays the stored response
+- same key and different payload returns conflict
+- insufficient funds is stored as an idempotent outcome

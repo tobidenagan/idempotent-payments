@@ -16,10 +16,13 @@ builder.Services.AddSingleton(sp =>
 
 builder.Services.AddSingleton<PaymentRepository>();
 builder.Services.AddSingleton<PaymentService>();
+builder.Services.AddSingleton<WalletRepository>();
+builder.Services.AddSingleton<WalletService>();
 
 var app = builder.Build();
 
 app.MapPaymentEndpoints();
+app.MapWalletEndpoints();
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
 
 if (app.Environment.IsDevelopment())
@@ -27,6 +30,9 @@ if (app.Environment.IsDevelopment())
     await using var scope = app.Services.CreateAsyncScope();
     var repository = scope.ServiceProvider.GetRequiredService<PaymentRepository>();
     await repository.EnsureSchemaAsync(CancellationToken.None);
+
+    var walletRepository = scope.ServiceProvider.GetRequiredService<WalletRepository>();
+    await walletRepository.EnsureSchemaAsync(CancellationToken.None);
 }
 
 app.Run();
