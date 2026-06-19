@@ -236,7 +236,11 @@ The project includes a simple background publisher that is disabled by default i
     "Enabled": false,
     "IntervalSeconds": 5,
     "BatchSize": 10,
-    "StaleLockSeconds": 300
+    "StaleLockSeconds": 300,
+    "MaxAttempts": 10,
+    "BaseDelaySeconds": 5,
+    "MaxDelaySeconds": 900,
+    "JitterPercent": 20
   }
 }
 ```
@@ -246,6 +250,16 @@ When enabled, the worker claims pending rows, logs a simulated publish, and mark
 The worker uses a claim step so multiple workers do not process the same rows at the same time. If publishing fails, the row is unlocked and can be retried.
 
 If a worker crashes after claiming a row but before marking it processed or failed, `StaleLockSeconds` allows another worker to reclaim the message later.
+
+Transient failures are retried using capped exponential backoff with jitter. The worker stores the calculated retry time in `next_attempt_at`, so the claim query ignores the row until it is due.
+
+Permanent failures and transient failures that exhaust `MaxAttempts` are dead-lettered. Inspect them with:
+
+```powershell
+curl http://localhost:8080/outbox/dead-lettered
+```
+
+Dead-lettered messages retain their payload, attempt count, last error, dead-letter time, and reason for investigation or controlled replay.
 
 ## Idempotent Consumer Demo
 

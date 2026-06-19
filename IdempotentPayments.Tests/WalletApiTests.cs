@@ -200,6 +200,9 @@ public sealed class WalletApiTests : IAsyncLifetime
         DateTimeOffset OccurredAt,
         DateTimeOffset? LockedAt,
         DateTimeOffset? ProcessedAt,
+        DateTimeOffset NextAttemptAt,
+        DateTimeOffset? DeadLetteredAt,
         int Attempts,
-        string? LastError);
+        string? LastError,
+        string? DeadLetterReason);
 }

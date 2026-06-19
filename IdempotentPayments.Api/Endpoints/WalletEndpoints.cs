@@ -56,6 +56,14 @@ public static class WalletEndpoints
             return Results.Ok(messages);
         });
 
+        app.MapGet("/outbox/dead-lettered", async (
+            WalletService service,
+            CancellationToken cancellationToken) =>
+        {
+            var messages = await service.GetDeadLetteredOutboxMessagesAsync(cancellationToken);
+            return Results.Ok(messages);
+        });
+
         return app;
     }
 }

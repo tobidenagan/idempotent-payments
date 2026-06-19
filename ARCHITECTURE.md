@@ -135,6 +135,29 @@ or locked_at < now() - (@stale_lock_seconds * interval '1 second')
 
 This prevents a message from being stuck forever if a worker crashes after claiming it but before marking it processed or failed.
 
+## Retry and dead-letter policy
+
+Transient publish failures are scheduled using exponential backoff with jitter:
+
+```text
+base delay * 2^(attempt - 1)
+apply random jitter
+cap at maximum delay
+```
+
+The calculated time is stored in `next_attempt_at`. The claim query selects only rows where `next_attempt_at <= now()`.
+
+Permanent failures are dead-lettered immediately. Transient failures are dead-lettered after `MaxAttempts`. Dead-letter state is recorded with:
+
+```text
+dead_lettered_at
+dead_letter_reason
+last_error
+attempts
+```
+
+An exhausted stale claim is also dead-lettered during the next claim cycle. This covers a worker crashing after claiming the final allowed attempt.
+
 ## Idempotent consumers
 
 The consumer side uses `processed_messages` to prevent duplicate event side effects.

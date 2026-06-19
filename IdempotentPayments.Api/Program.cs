@@ -20,6 +20,7 @@ builder.Services.AddSingleton<WalletRepository>();
 builder.Services.AddSingleton<WalletService>();
 builder.Services.AddSingleton<ConsumerRepository>();
 builder.Services.AddSingleton<ConsumerService>();
+builder.Services.AddSingleton<IOutboxTransport, LoggingOutboxTransport>();
 builder.Services.Configure<OutboxPublisherOptions>(builder.Configuration.GetSection("OutboxPublisher"));
 builder.Services.AddHostedService<OutboxPublisherService>();
 

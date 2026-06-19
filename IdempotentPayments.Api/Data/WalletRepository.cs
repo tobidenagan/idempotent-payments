@@ -48,12 +48,24 @@ public sealed class WalletRepository
                 occurred_at timestamptz not null default now(),
                 locked_at timestamptz,
                 processed_at timestamptz,
+                next_attempt_at timestamptz not null default now(),
+                dead_lettered_at timestamptz,
                 attempts integer not null default 0,
-                last_error text
+                last_error text,
+                dead_letter_reason text
             );
 
             alter table outbox_messages
             add column if not exists locked_at timestamptz;
+
+            alter table outbox_messages
+            add column if not exists next_attempt_at timestamptz not null default now();
+
+            alter table outbox_messages
+            add column if not exists dead_lettered_at timestamptz;
+
+            alter table outbox_messages
+            add column if not exists dead_letter_reason text;
             """;
 
         await using var command = _dataSource.CreateCommand(sql);
@@ -156,9 +168,11 @@ public sealed class WalletRepository
         CancellationToken cancellationToken)
     {
         const string sql = """
-            select id, type, payload::text, occurred_at, locked_at, processed_at, attempts, last_error
+            select id, type, payload::text, occurred_at, locked_at, processed_at,
+                   next_attempt_at, dead_lettered_at, attempts, last_error, dead_letter_reason
             from outbox_messages
             where processed_at is null
+              and dead_lettered_at is null
             order by occurred_at, id;
             """;
 
@@ -176,8 +190,46 @@ public sealed class WalletRepository
                 reader.GetFieldValue<DateTimeOffset>(3),
                 reader.IsDBNull(4) ? null : reader.GetFieldValue<DateTimeOffset>(4),
                 reader.IsDBNull(5) ? null : reader.GetFieldValue<DateTimeOffset>(5),
-                reader.GetInt32(6),
-                reader.IsDBNull(7) ? null : reader.GetString(7)));
+                reader.GetFieldValue<DateTimeOffset>(6),
+                reader.IsDBNull(7) ? null : reader.GetFieldValue<DateTimeOffset>(7),
+                reader.GetInt32(8),
+                reader.IsDBNull(9) ? null : reader.GetString(9),
+                reader.IsDBNull(10) ? null : reader.GetString(10)));
+        }
+
+        return messages;
+    }
+
+    public async Task<IReadOnlyList<OutboxMessageResponse>> GetDeadLetteredOutboxMessagesAsync(
+        CancellationToken cancellationToken)
+    {
+        const string sql = """
+            select id, type, payload::text, occurred_at, locked_at, processed_at,
+                   next_attempt_at, dead_lettered_at, attempts, last_error, dead_letter_reason
+            from outbox_messages
+            where dead_lettered_at is not null
+            order by dead_lettered_at desc, id;
+            """;
+
+        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken);
+        await using var command = new NpgsqlCommand(sql, connection);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+
+        var messages = new List<OutboxMessageResponse>();
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            messages.Add(new OutboxMessageResponse(
+                reader.GetString(0),
+                reader.GetString(1),
+                reader.GetString(2),
+                reader.GetFieldValue<DateTimeOffset>(3),
+                reader.IsDBNull(4) ? null : reader.GetFieldValue<DateTimeOffset>(4),
+                reader.IsDBNull(5) ? null : reader.GetFieldValue<DateTimeOffset>(5),
+                reader.GetFieldValue<DateTimeOffset>(6),
+                reader.IsDBNull(7) ? null : reader.GetFieldValue<DateTimeOffset>(7),
+                reader.GetInt32(8),
+                reader.IsDBNull(9) ? null : reader.GetString(9),
+                reader.IsDBNull(10) ? null : reader.GetString(10)));
         }
 
         return messages;
@@ -186,13 +238,34 @@ public sealed class WalletRepository
     public async Task<IReadOnlyList<OutboxPublishResult>> ClaimPendingOutboxMessagesAsync(
         int batchSize,
         int staleLockSeconds,
+        int maxAttempts,
         CancellationToken cancellationToken)
     {
         const string sql = """
-            with next_messages as (
+            with exhausted_messages as (
+                update outbox_messages
+                set locked_at = null,
+                    dead_lettered_at = now(),
+                    dead_letter_reason = coalesce(
+                        last_error,
+                        'Maximum attempts exhausted after an abandoned claim'
+                    )
+                where processed_at is null
+                  and dead_lettered_at is null
+                  and attempts >= @max_attempts
+                  and (
+                      locked_at is null
+                      or locked_at < now() - (@stale_lock_seconds * interval '1 second')
+                  )
+                returning id
+            ),
+            next_messages as (
                 select id
                 from outbox_messages
                 where processed_at is null
+                  and dead_lettered_at is null
+                  and next_attempt_at <= now()
+                  and attempts < @max_attempts
                   and (
                       locked_at is null
                       or locked_at < now() - (@stale_lock_seconds * interval '1 second')
@@ -206,7 +279,8 @@ public sealed class WalletRepository
                 attempts = attempts + 1
             from next_messages
             where outbox_messages.id = next_messages.id
-            returning outbox_messages.id, outbox_messages.type, outbox_messages.payload::text;
+            returning outbox_messages.id, outbox_messages.type,
+                      outbox_messages.payload::text, outbox_messages.attempts;
             """;
 
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken);
@@ -214,6 +288,7 @@ public sealed class WalletRepository
         await using var command = new NpgsqlCommand(sql, connection);
         command.Parameters.AddWithValue("batch_size", batchSize);
         command.Parameters.AddWithValue("stale_lock_seconds", staleLockSeconds);
+        command.Parameters.AddWithValue("max_attempts", maxAttempts);
 
         var messages = new List<OutboxPublishResult>();
         await using (var reader = await command.ExecuteReaderAsync(cancellationToken))
@@ -223,7 +298,8 @@ public sealed class WalletRepository
                 messages.Add(new OutboxPublishResult(
                     reader.GetString(0),
                     reader.GetString(1),
-                    reader.GetString(2)));
+                    reader.GetString(2),
+                    reader.GetInt32(3)));
             }
         }
 
@@ -248,14 +324,16 @@ public sealed class WalletRepository
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    public async Task MarkOutboxMessageFailedAsync(
+    public async Task ScheduleOutboxMessageRetryAsync(
         string messageId,
         string error,
+        DateTimeOffset nextAttemptAt,
         CancellationToken cancellationToken)
     {
         const string sql = """
             update outbox_messages
             set locked_at = null,
+                next_attempt_at = @next_attempt_at,
                 last_error = @last_error
             where id = @id;
             """;
@@ -263,6 +341,27 @@ public sealed class WalletRepository
         await using var command = _dataSource.CreateCommand(sql);
         command.Parameters.AddWithValue("id", messageId);
         command.Parameters.AddWithValue("last_error", error);
+        command.Parameters.AddWithValue("next_attempt_at", nextAttemptAt);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task DeadLetterOutboxMessageAsync(
+        string messageId,
+        string reason,
+        CancellationToken cancellationToken)
+    {
+        const string sql = """
+            update outbox_messages
+            set locked_at = null,
+                dead_lettered_at = now(),
+                dead_letter_reason = @reason,
+                last_error = @reason
+            where id = @id;
+            """;
+
+        await using var command = _dataSource.CreateCommand(sql);
+        command.Parameters.AddWithValue("id", messageId);
+        command.Parameters.AddWithValue("reason", reason);
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
