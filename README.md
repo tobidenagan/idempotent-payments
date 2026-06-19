@@ -16,6 +16,8 @@ The goal of this project is educational: show the production correctness ideas b
 - Wallet debit double-spend prevention
 - Immutable ledger entries
 - Atomic conditional balance updates
+- Database outbox for reliable event publishing
+- Idempotent event consumers with `processed_messages`
 
 ## Project Structure
 
@@ -32,6 +34,7 @@ IdempotentPayments.Tests/
   PaymentValidationTests.cs
   PaymentApiTests.cs
   WalletApiTests.cs
+  ConsumerApiTests.cs
 ```
 
 The most important files to study are:
@@ -207,6 +210,72 @@ returning balance;
 - Wallet update and ledger insert happen in the same transaction.
 - Debit attempts are idempotent, including insufficient-funds outcomes.
 
+## Outbox Pattern
+
+Successful wallet debits also insert a `WalletDebited` message into `outbox_messages` inside the same database transaction as:
+
+```text
+wallet balance update
+ledger entry insert
+idempotency completion
+```
+
+This prevents the bad state where the wallet debit commits but no durable event exists to publish.
+
+For learning and inspection, pending outbox messages can be read with:
+
+```powershell
+curl http://localhost:8080/outbox/pending
+```
+
+The project includes a simple background publisher that is disabled by default in `appsettings.json`:
+
+```json
+{
+  "OutboxPublisher": {
+    "Enabled": false,
+    "IntervalSeconds": 5,
+    "BatchSize": 10,
+    "StaleLockSeconds": 300
+  }
+}
+```
+
+When enabled, the worker claims pending rows, logs a simulated publish, and marks them processed. A real production version would publish to a broker such as RabbitMQ, Kafka, Azure Service Bus, or SQS.
+
+The worker uses a claim step so multiple workers do not process the same rows at the same time. If publishing fails, the row is unlocked and can be retried.
+
+If a worker crashes after claiming a row but before marking it processed or failed, `StaleLockSeconds` allows another worker to reclaim the message later.
+
+## Idempotent Consumer Demo
+
+The producer side can publish the same event more than once, so consumers must also be idempotent.
+
+This project includes a teaching endpoint:
+
+```http
+POST /consumers/{consumerName}/events
+```
+
+Example:
+
+```powershell
+curl -X POST http://localhost:8080/consumers/EmailReceiptConsumer/events `
+  -H "Content-Type: application/json" `
+  -d "{\"eventId\":\"evt_123\",\"type\":\"WalletDebited\",\"payload\":\"{\\\"amount\\\":8000,\\\"currency\\\":\\\"USD\\\"}\"}"
+```
+
+The consumer records processed events in `processed_messages` with a unique constraint on:
+
+```text
+consumer_name + event_id
+```
+
+That means:
+
+- the same consumer ignores duplicate deliveries of the same event
+- different consumers can process the same event independently
+
 ## Tests
 
 Restore and build:
@@ -236,3 +305,4 @@ Read these in order:
 6. `IdempotentPayments.Api/Data/WalletRepository.cs`
 7. `IdempotentPayments.Tests/PaymentApiTests.cs`
 8. `IdempotentPayments.Tests/WalletApiTests.cs`
+9. `IdempotentPayments.Tests/ConsumerApiTests.cs`

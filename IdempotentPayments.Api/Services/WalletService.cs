@@ -49,6 +49,12 @@ public sealed class WalletService
         return _repository.DebitWalletIdempotentlyAsync(normalizedCustomerId, normalizedRequest, requestHash, cancellationToken);
     }
 
+    public Task<IReadOnlyList<OutboxMessageResponse>> GetPendingOutboxMessagesAsync(
+        CancellationToken cancellationToken)
+    {
+        return _repository.GetPendingOutboxMessagesAsync(cancellationToken);
+    }
+
     private static string HashDebitRequest(string customerId, DebitWalletRequest request)
     {
         var canonical = JsonSerializer.Serialize(new

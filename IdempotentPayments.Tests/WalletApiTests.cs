@@ -66,6 +66,31 @@ public sealed class WalletApiTests : IAsyncLifetime
     }
 
     [Fact]
+  
+    
+    
+    public async Task SuccessfulDebitCreatesPendingOutboxMessage()
+    {
+        await CreditAsync("cust_wallet_outbox_1", 10000, "fund_outbox_1");
+
+        var debit = await _client.PostAsJsonAsync(
+            "/wallets/cust_wallet_outbox_1/debits",
+            NewDebit("debit_outbox_1", "order_outbox_1", 8000));
+
+        Assert.Equal(HttpStatusCode.Created, debit.StatusCode);
+
+        var messages = await _client.GetFromJsonAsync<List<OutboxMessageResponse>>("/outbox/pending");
+
+        Assert.NotNull(messages);
+        var message = Assert.Single(messages.Where(message => message.Type == "WalletDebited"));
+        Assert.StartsWith("evt_", message.Id);
+        Assert.Contains("cust_wallet_outbox_1", message.Payload);
+        Assert.Contains("order_outbox_1", message.Payload);
+        Assert.Null(message.ProcessedAt);
+        Assert.Equal(0, message.Attempts);
+    }
+
+    [Fact]
     public async Task DuplicateDebitReturnsOriginalResponse()
     {
         await CreditAsync("cust_wallet_2", 10000, "fund_2");
@@ -105,6 +130,10 @@ public sealed class WalletApiTests : IAsyncLifetime
             NewDebit("debit_4", "order_4", 8000));
 
         Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
+
+        var messages = await _client.GetFromJsonAsync<List<OutboxMessageResponse>>("/outbox/pending");
+        Assert.NotNull(messages);
+        Assert.DoesNotContain(messages, message => message.Payload.Contains("cust_wallet_4"));
     }
 
     [Fact]
@@ -163,4 +192,14 @@ public sealed class WalletApiTests : IAsyncLifetime
         string Currency,
         long Balance,
         string Reference);
+
+    private sealed record OutboxMessageResponse(
+        string Id,
+        string Type,
+        string Payload,
+        DateTimeOffset OccurredAt,
+        DateTimeOffset? LockedAt,
+        DateTimeOffset? ProcessedAt,
+        int Attempts,
+        string? LastError);
 }

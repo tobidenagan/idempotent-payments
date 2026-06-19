@@ -88,3 +88,69 @@ Debit idempotency follows the same model as payment idempotency:
 - same key and same payload replays the stored response
 - same key and different payload returns conflict
 - insufficient funds is stored as an idempotent outcome
+
+## Outbox pattern
+
+The wallet debit flow inserts a `WalletDebited` message into `outbox_messages` in the same transaction as the wallet update, ledger insert, and idempotency completion.
+
+This handles the database side of the outbox pattern:
+
+```text
+begin transaction
+claim idempotency key
+debit wallet
+insert ledger entry
+insert outbox message
+complete idempotency key
+commit
+```
+
+If the transaction commits, both the debit and the intent to publish an event exist. If the transaction rolls back, neither exists.
+
+The outbox does not guarantee exactly-once delivery. A later publisher can still send the same event more than once if it crashes after publishing but before marking the outbox message as processed. Consumers must be idempotent, usually by storing processed event IDs with a unique constraint.
+
+## Background publisher
+
+The project includes a simple hosted service, `OutboxPublisherService`, disabled by default.
+
+When enabled, it:
+
+```text
+claims pending outbox rows
+publishes each message
+marks successful messages processed
+unlocks failed messages for retry
+```
+
+The claim query uses `FOR UPDATE SKIP LOCKED` plus a `locked_at` marker. `SKIP LOCKED` prevents concurrent workers from claiming the same row during the claim transaction, and `locked_at` keeps the row reserved after the claim transaction commits.
+
+In this teaching project, publishing is simulated with a structured log line. In a production system, `PublishAsync` would send to a real broker.
+
+The claim query also supports stale lock recovery:
+
+```sql
+locked_at is null
+or locked_at < now() - (@stale_lock_seconds * interval '1 second')
+```
+
+This prevents a message from being stuck forever if a worker crashes after claiming it but before marking it processed or failed.
+
+## Idempotent consumers
+
+The consumer side uses `processed_messages` to prevent duplicate event side effects.
+
+The important uniqueness rule is:
+
+```sql
+unique (consumer_name, event_id)
+```
+
+This lets each consumer process an event once for itself:
+
+```text
+EmailReceiptConsumer + evt_123 -> processed once
+AnalyticsConsumer + evt_123 -> processed once
+EmailReceiptConsumer + evt_123 again -> duplicate ignored
+```
+
+This is the consumer-side companion to the outbox pattern. The outbox gives at-least-once publishing, and `processed_messages` makes duplicate deliveries safe.

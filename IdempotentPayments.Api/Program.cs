@@ -18,11 +18,16 @@ builder.Services.AddSingleton<PaymentRepository>();
 builder.Services.AddSingleton<PaymentService>();
 builder.Services.AddSingleton<WalletRepository>();
 builder.Services.AddSingleton<WalletService>();
+builder.Services.AddSingleton<ConsumerRepository>();
+builder.Services.AddSingleton<ConsumerService>();
+builder.Services.Configure<OutboxPublisherOptions>(builder.Configuration.GetSection("OutboxPublisher"));
+builder.Services.AddHostedService<OutboxPublisherService>();
 
 var app = builder.Build();
 
 app.MapPaymentEndpoints();
 app.MapWalletEndpoints();
+app.MapConsumerEndpoints();
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
 
 if (app.Environment.IsDevelopment())
@@ -33,6 +38,9 @@ if (app.Environment.IsDevelopment())
 
     var walletRepository = scope.ServiceProvider.GetRequiredService<WalletRepository>();
     await walletRepository.EnsureSchemaAsync(CancellationToken.None);
+
+    var consumerRepository = scope.ServiceProvider.GetRequiredService<ConsumerRepository>();
+    await consumerRepository.EnsureSchemaAsync(CancellationToken.None);
 }
 
 app.Run();

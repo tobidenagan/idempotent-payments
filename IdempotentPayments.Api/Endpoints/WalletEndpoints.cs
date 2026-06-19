@@ -48,6 +48,14 @@ public static class WalletEndpoints
             };
         });
 
+        app.MapGet("/outbox/pending", async (
+            WalletService service,
+            CancellationToken cancellationToken) =>
+        {
+            var messages = await service.GetPendingOutboxMessagesAsync(cancellationToken);
+            return Results.Ok(messages);
+        });
+
         return app;
     }
 }

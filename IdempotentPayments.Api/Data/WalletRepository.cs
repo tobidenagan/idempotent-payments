@@ -40,6 +40,20 @@ public sealed class WalletRepository
                 created_at timestamptz not null default now(),
                 unique (wallet_id, reference, direction)
             );
+
+            create table if not exists outbox_messages (
+                id text primary key,
+                type text not null,
+                payload jsonb not null,
+                occurred_at timestamptz not null default now(),
+                locked_at timestamptz,
+                processed_at timestamptz,
+                attempts integer not null default 0,
+                last_error text
+            );
+
+            alter table outbox_messages
+            add column if not exists locked_at timestamptz;
             """;
 
         await using var command = _dataSource.CreateCommand(sql);
@@ -112,6 +126,17 @@ public sealed class WalletRepository
             request.Reference,
             cancellationToken);
 
+        await InsertWalletDebitedOutboxMessageAsync(
+            connection,
+            wallet.WalletId,
+            ledgerEntryId,
+            customerId,
+            request.Amount,
+            request.Currency,
+            debited.Value,
+            request.Reference,
+            cancellationToken);
+
         var debitResponse = new WalletDebitResponse(
             wallet.WalletId,
             ledgerEntryId,
@@ -125,6 +150,120 @@ public sealed class WalletRepository
         await transaction.CommitAsync(cancellationToken);
 
         return new WalletDebitResult(WalletResultKind.Created, debitResponse);
+    }
+
+    public async Task<IReadOnlyList<OutboxMessageResponse>> GetPendingOutboxMessagesAsync(
+        CancellationToken cancellationToken)
+    {
+        const string sql = """
+            select id, type, payload::text, occurred_at, locked_at, processed_at, attempts, last_error
+            from outbox_messages
+            where processed_at is null
+            order by occurred_at, id;
+            """;
+
+        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken);
+        await using var command = new NpgsqlCommand(sql, connection);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+
+        var messages = new List<OutboxMessageResponse>();
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            messages.Add(new OutboxMessageResponse(
+                reader.GetString(0),
+                reader.GetString(1),
+                reader.GetString(2),
+                reader.GetFieldValue<DateTimeOffset>(3),
+                reader.IsDBNull(4) ? null : reader.GetFieldValue<DateTimeOffset>(4),
+                reader.IsDBNull(5) ? null : reader.GetFieldValue<DateTimeOffset>(5),
+                reader.GetInt32(6),
+                reader.IsDBNull(7) ? null : reader.GetString(7)));
+        }
+
+        return messages;
+    }
+
+    public async Task<IReadOnlyList<OutboxPublishResult>> ClaimPendingOutboxMessagesAsync(
+        int batchSize,
+        int staleLockSeconds,
+        CancellationToken cancellationToken)
+    {
+        const string sql = """
+            with next_messages as (
+                select id
+                from outbox_messages
+                where processed_at is null
+                  and (
+                      locked_at is null
+                      or locked_at < now() - (@stale_lock_seconds * interval '1 second')
+                  )
+                order by occurred_at, id
+                limit @batch_size
+                for update skip locked
+            )
+            update outbox_messages
+            set locked_at = now(),
+                attempts = attempts + 1
+            from next_messages
+            where outbox_messages.id = next_messages.id
+            returning outbox_messages.id, outbox_messages.type, outbox_messages.payload::text;
+            """;
+
+        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        await using var command = new NpgsqlCommand(sql, connection);
+        command.Parameters.AddWithValue("batch_size", batchSize);
+        command.Parameters.AddWithValue("stale_lock_seconds", staleLockSeconds);
+
+        var messages = new List<OutboxPublishResult>();
+        await using (var reader = await command.ExecuteReaderAsync(cancellationToken))
+        {
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                messages.Add(new OutboxPublishResult(
+                    reader.GetString(0),
+                    reader.GetString(1),
+                    reader.GetString(2)));
+            }
+        }
+
+        await transaction.CommitAsync(cancellationToken);
+        return messages;
+    }
+
+    public async Task MarkOutboxMessageProcessedAsync(
+        string messageId,
+        CancellationToken cancellationToken)
+    {
+        const string sql = """
+            update outbox_messages
+            set processed_at = now(),
+                locked_at = null,
+                last_error = null
+            where id = @id;
+            """;
+
+        await using var command = _dataSource.CreateCommand(sql);
+        command.Parameters.AddWithValue("id", messageId);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task MarkOutboxMessageFailedAsync(
+        string messageId,
+        string error,
+        CancellationToken cancellationToken)
+    {
+        const string sql = """
+            update outbox_messages
+            set locked_at = null,
+                last_error = @last_error
+            where id = @id;
+            """;
+
+        await using var command = _dataSource.CreateCommand(sql);
+        command.Parameters.AddWithValue("id", messageId);
+        command.Parameters.AddWithValue("last_error", error);
+        await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
     private static async Task<WalletResponse> GetOrCreateWalletAsync(
@@ -242,6 +381,44 @@ public sealed class WalletRepository
 
         return (string)(await command.ExecuteScalarAsync(cancellationToken)
             ?? throw new InvalidOperationException("Ledger entry could not be inserted."));
+    }
+
+    private static async Task InsertWalletDebitedOutboxMessageAsync(
+        NpgsqlConnection connection,
+        string walletId,
+        string ledgerEntryId,
+        string customerId,
+        long amount,
+        string currency,
+        long balance,
+        string reference,
+        CancellationToken cancellationToken)
+    {
+        const string sql = """
+            insert into outbox_messages (id, type, payload)
+            values (@id, @type, @payload);
+            """;
+
+        var eventId = $"evt_{Guid.NewGuid():N}";
+        var payload = JsonSerializer.Serialize(new
+        {
+            EventId = eventId,
+            Type = "WalletDebited",
+            WalletId = walletId,
+            LedgerEntryId = ledgerEntryId,
+            CustomerId = customerId,
+            Amount = amount,
+            Currency = currency,
+            Balance = balance,
+            Reference = reference
+        }, JsonOptions);
+
+        await using var command = new NpgsqlCommand(sql, connection);
+        command.Parameters.AddWithValue("id", eventId);
+        command.Parameters.AddWithValue("type", "WalletDebited");
+        command.Parameters.AddWithValue("payload", NpgsqlDbType.Jsonb, payload);
+
+        await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
     private static async Task<bool> TryInsertIdempotencyKeyAsync(
