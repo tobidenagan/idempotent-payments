@@ -200,6 +200,24 @@ public sealed class WalletRepository
         return messages;
     }
 
+    public async Task<(int Pending, int DeadLettered)> GetOutboxCountsAsync(
+        CancellationToken cancellationToken)
+    {
+        const string sql = """
+            select
+                count(*) filter (where processed_at is null and dead_lettered_at is null) as pending,
+                count(*) filter (where dead_lettered_at is not null) as dead_lettered
+            from outbox_messages;
+            """;
+
+        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken);
+        await using var command = new NpgsqlCommand(sql, connection);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        await reader.ReadAsync(cancellationToken);
+
+        return (checked((int)reader.GetInt64(0)), checked((int)reader.GetInt64(1)));
+    }
+
     public async Task<IReadOnlyList<OutboxMessageResponse>> GetDeadLetteredOutboxMessagesAsync(
         CancellationToken cancellationToken)
     {

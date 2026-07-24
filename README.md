@@ -18,6 +18,9 @@ The goal of this project is educational: show the production correctness ideas b
 - Atomic conditional balance updates
 - Database outbox for reliable event publishing
 - Idempotent event consumers with `processed_messages`
+- Structured JSON logs with correlation and trace identifiers
+- OpenTelemetry traces and metrics
+- Separate liveness and PostgreSQL readiness checks
 
 ## Project Structure
 
@@ -260,6 +263,34 @@ curl http://localhost:8080/outbox/dead-lettered
 ```
 
 Dead-lettered messages retain their payload, attempt count, last error, dead-letter time, and reason for investigation or controlled replay.
+
+## Observability
+
+The API emits structured JSON logs and returns an `X-Correlation-ID` response header. Callers may supply the header; otherwise the API generates one.
+
+OpenTelemetry exports traces and metrics to the console for local learning. Custom telemetry includes:
+
+```text
+payments.attempts
+wallet.debit.attempts
+consumer.events
+outbox.publish.attempts
+application.operation.duration
+outbox.pending
+outbox.dead_lettered
+```
+
+The metric tags intentionally use low-cardinality values such as result, currency, and event type. Identifiers such as payment ID and event ID belong in logs/traces, not metric labels.
+
+Health endpoints:
+
+```text
+GET /health/live   process liveness only
+GET /health/ready  PostgreSQL readiness
+GET /health        compatibility alias for readiness
+```
+
+Liveness remains healthy during a PostgreSQL outage, while readiness becomes unhealthy.
 
 ## Idempotent Consumer Demo
 

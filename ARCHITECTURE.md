@@ -177,3 +177,26 @@ EmailReceiptConsumer + evt_123 again -> duplicate ignored
 ```
 
 This is the consumer-side companion to the outbox pattern. The outbox gives at-least-once publishing, and `processed_messages` makes duplicate deliveries safe.
+
+## Observability
+
+The application uses OpenTelemetry with ASP.NET Core instrumentation, custom `ActivitySource` spans, custom metrics, and console exporters.
+
+Structured JSON logs include correlation and trace scopes. Business logs use named fields for payment, wallet, ledger, event, customer, result, and failure context without logging full sensitive payloads.
+
+Custom spans cover:
+
+```text
+payment.create
+wallet.debit
+consumer.process
+outbox.publish
+```
+
+Custom metrics use counters, histograms, and observable gauges. High-cardinality identifiers are excluded from metric tags.
+
+Health checks are separated by purpose:
+
+- `/health/live` verifies that the process is alive.
+- `/health/ready` verifies that PostgreSQL is reachable.
+- `/health` is a compatibility alias for readiness.

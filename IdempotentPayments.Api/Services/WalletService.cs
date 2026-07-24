@@ -1,9 +1,11 @@
 using System.Security.Cryptography;
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using IdempotentPayments.Api.Contracts;
 using IdempotentPayments.Api.Data;
 using IdempotentPayments.Api.Domain;
+using IdempotentPayments.Api.Observability;
 
 namespace IdempotentPayments.Api.Services;
 
@@ -11,10 +13,12 @@ public sealed class WalletService
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private readonly WalletRepository _repository;
+    private readonly ILogger<WalletService> _logger;
 
-    public WalletService(WalletRepository repository)
+    public WalletService(WalletRepository repository, ILogger<WalletService> logger)
     {
         _repository = repository;
+        _logger = logger;
     }
 
     public Task<WalletResponse> CreditWalletAsync(
@@ -32,11 +36,12 @@ public sealed class WalletService
         return _repository.CreditWalletAsync(normalizedCustomerId, normalizedRequest, cancellationToken);
     }
 
-    public Task<WalletDebitResult> DebitWalletAsync(
+    public async Task<WalletDebitResult> DebitWalletAsync(
         string customerId,
         DebitWalletRequest request,
         CancellationToken cancellationToken)
     {
+        var startedAt = Stopwatch.GetTimestamp();
         var normalizedCustomerId = customerId.Trim();
         var normalizedRequest = request with
         {
@@ -46,7 +51,65 @@ public sealed class WalletService
         };
 
         var requestHash = HashDebitRequest(normalizedCustomerId, normalizedRequest);
-        return _repository.DebitWalletIdempotentlyAsync(normalizedCustomerId, normalizedRequest, requestHash, cancellationToken);
+
+        using var activity = AppObservability.ActivitySource.StartActivity("wallet.debit");
+        activity?.SetTag("wallet.currency", normalizedRequest.Currency);
+
+        try
+        {
+            var result = await _repository.DebitWalletIdempotentlyAsync(
+                normalizedCustomerId,
+                normalizedRequest,
+                requestHash,
+                cancellationToken);
+
+            var resultName = result.Kind.ToString();
+            activity?.SetTag("wallet.debit.result", resultName);
+            activity?.SetTag("wallet.id", result.Response?.WalletId);
+            activity?.SetTag("ledger.entry.id", result.Response?.LedgerEntryId);
+
+            AppObservability.WalletDebitAttempts.Add(
+                1,
+                new KeyValuePair<string, object?>("result", resultName),
+                new KeyValuePair<string, object?>("currency", normalizedRequest.Currency));
+
+            if (result.Kind == WalletResultKind.Created || result.Kind == WalletResultKind.Replayed)
+            {
+                _logger.LogInformation(
+                    "Wallet debit returned result {DebitResult} for wallet {WalletId}, customer {CustomerId}, and reference {Reference}",
+                    resultName,
+                    result.Response!.WalletId,
+                    normalizedCustomerId,
+                    normalizedRequest.Reference);
+            }
+            else
+            {
+                _logger.LogWarning(
+                    "Wallet debit returned result {DebitResult} for customer {CustomerId} and reference {Reference}",
+                    resultName,
+                    normalizedCustomerId,
+                    normalizedRequest.Reference);
+            }
+
+            return result;
+        }
+        catch (Exception ex)
+        {
+            activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+            AppObservability.WalletDebitAttempts.Add(1, new KeyValuePair<string, object?>("result", "Error"));
+            _logger.LogError(
+                ex,
+                "Wallet debit failed for customer {CustomerId} and reference {Reference}",
+                normalizedCustomerId,
+                normalizedRequest.Reference);
+            throw;
+        }
+        finally
+        {
+            AppObservability.OperationDuration.Record(
+                Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
+                new KeyValuePair<string, object?>("operation", "wallet.debit"));
+        }
     }
 
     public Task<IReadOnlyList<OutboxMessageResponse>> GetPendingOutboxMessagesAsync(

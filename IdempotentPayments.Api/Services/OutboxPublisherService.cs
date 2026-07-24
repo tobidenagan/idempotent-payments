@@ -1,5 +1,7 @@
 using IdempotentPayments.Api.Data;
+using IdempotentPayments.Api.Observability;
 using Microsoft.Extensions.Options;
+using System.Diagnostics;
 
 namespace IdempotentPayments.Api.Services;
 
@@ -49,13 +51,30 @@ public sealed class OutboxPublisherService : BackgroundService
 
         foreach (var message in messages)
         {
+            var startedAt = Stopwatch.GetTimestamp();
+            using var activity = AppObservability.ActivitySource.StartActivity("outbox.publish");
+            activity?.SetTag("messaging.message.id", message.Id);
+            activity?.SetTag("messaging.message.type", message.Type);
+            activity?.SetTag("messaging.publish.attempt", message.Attempts);
+
             try
             {
                 await _transport.PublishAsync(message, cancellationToken);
                 await _repository.MarkOutboxMessageProcessedAsync(message.Id, cancellationToken);
+                activity?.SetTag("messaging.publish.result", "Processed");
+                AppObservability.OutboxPublishAttempts.Add(
+                    1,
+                    new KeyValuePair<string, object?>("result", "Processed"),
+                    new KeyValuePair<string, object?>("event.type", message.Type));
             }
             catch (PermanentPublishException ex)
             {
+                activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+                activity?.SetTag("messaging.publish.result", "DeadLettered");
+                AppObservability.OutboxPublishAttempts.Add(
+                    1,
+                    new KeyValuePair<string, object?>("result", "DeadLettered"),
+                    new KeyValuePair<string, object?>("event.type", message.Type));
                 _logger.LogError(ex, "Permanently failed outbox message {OutboxMessageId}", message.Id);
                 await _repository.DeadLetterOutboxMessageAsync(message.Id, ex.Message, cancellationToken);
             }
@@ -67,6 +86,12 @@ public sealed class OutboxPublisherService : BackgroundService
             {
                 if (message.Attempts >= _options.MaxAttempts)
                 {
+                    activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+                    activity?.SetTag("messaging.publish.result", "DeadLettered");
+                    AppObservability.OutboxPublishAttempts.Add(
+                        1,
+                        new KeyValuePair<string, object?>("result", "DeadLettered"),
+                        new KeyValuePair<string, object?>("event.type", message.Type));
                     _logger.LogError(
                         ex,
                         "Outbox message {OutboxMessageId} exhausted {Attempts} attempts",
@@ -79,6 +104,13 @@ public sealed class OutboxPublisherService : BackgroundService
 
                 var delay = RetryDelayCalculator.Calculate(message.Attempts, _options);
                 var nextAttemptAt = DateTimeOffset.UtcNow.Add(delay);
+                activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+                activity?.SetTag("messaging.publish.result", "RetryScheduled");
+                activity?.SetTag("messaging.next_attempt_at", nextAttemptAt);
+                AppObservability.OutboxPublishAttempts.Add(
+                    1,
+                    new KeyValuePair<string, object?>("result", "RetryScheduled"),
+                    new KeyValuePair<string, object?>("event.type", message.Type));
 
                 _logger.LogWarning(
                     ex,
@@ -92,6 +124,13 @@ public sealed class OutboxPublisherService : BackgroundService
                     ex.Message,
                     nextAttemptAt,
                     cancellationToken);
+            }
+            finally
+            {
+                AppObservability.OperationDuration.Record(
+                    Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
+                    new KeyValuePair<string, object?>("operation", "outbox.publish"),
+                    new KeyValuePair<string, object?>("event.type", message.Type));
             }
         }
     }

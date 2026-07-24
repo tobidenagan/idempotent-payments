@@ -112,6 +112,30 @@ public sealed class PaymentApiTests : IAsyncLifetime
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
     }
 
+    [Fact]
+    public async Task LivenessAndReadinessAreHealthyWhenPostgresIsAvailable()
+    {
+        var liveness = await _client.GetAsync("/health/live");
+        var readiness = await _client.GetAsync("/health/ready");
+
+        Assert.Equal(HttpStatusCode.OK, liveness.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, readiness.StatusCode);
+    }
+
+    [Fact]
+    public async Task CorrelationIdIsReturnedToCaller()
+    {
+        const string correlationId = "corr_test_123";
+        using var request = new HttpRequestMessage(HttpMethod.Get, "/health/live");
+        request.Headers.Add("X-Correlation-ID", correlationId);
+
+        var response = await _client.SendAsync(request);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.True(response.Headers.TryGetValues("X-Correlation-ID", out var values));
+        Assert.Equal(correlationId, Assert.Single(values));
+    }
+
     private static CreatePaymentRequest NewRequest(string idempotencyKey) =>
         new(5000, "USD", "cust_123", idempotencyKey);
 
