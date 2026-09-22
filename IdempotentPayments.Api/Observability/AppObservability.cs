@@ -15,6 +15,12 @@ public static class AppObservability
     public static readonly Counter<long> PaymentAttempts =
         Meter.CreateCounter<long>("payments.attempts", unit: "{attempt}");
 
+    public static readonly Counter<long> IdempotencyReplays =
+        Meter.CreateCounter<long>("idempotency.replays", unit: "{replay}");
+
+    public static readonly Counter<long> IdempotencyConflicts =
+        Meter.CreateCounter<long>("idempotency.conflicts", unit: "{conflict}");
+
     public static readonly Counter<long> WalletDebitAttempts =
         Meter.CreateCounter<long>("wallet.debit.attempts", unit: "{attempt}");
 

@@ -218,6 +218,73 @@ public sealed class WalletRepository
         return (checked((int)reader.GetInt64(0)), checked((int)reader.GetInt64(1)));
     }
 
+    public async Task<DashboardMetricsSnapshot> GetDashboardMetricsAsync(
+        CancellationToken cancellationToken)
+    {
+        const string sql = """
+            with ledger_balances as (
+                select
+                    wallet_id,
+                    sum(
+                        case direction
+                            when 'Credit' then amount
+                            when 'Debit' then -amount
+                        end
+                    ) as ledger_balance
+                from ledger_entries
+                group by wallet_id
+            )
+            select
+                count(*) filter (
+                    where processed_at is null
+                      and dead_lettered_at is null
+                ) as pending_outbox_messages,
+                count(*) filter (
+                    where dead_lettered_at is not null
+                ) as dead_lettered_outbox_messages,
+                coalesce(
+                    extract(epoch from (
+                        now() - min(occurred_at) filter (
+                            where processed_at is null
+                              and dead_lettered_at is null
+                        )
+                    ))::double precision,
+                    0
+                ) as oldest_pending_outbox_age_seconds,
+                (
+                    select count(*)
+                    from idempotency_keys
+                    where state = 'InProgress'
+                      and updated_at < now() - interval '5 minutes'
+                ) as stale_in_progress_idempotency_keys,
+                (
+                    select count(*)
+                    from wallets
+                    where balance < 0
+                ) as negative_wallet_balances,
+                (
+                    select count(*)
+                    from wallets
+                    left join ledger_balances on ledger_balances.wallet_id = wallets.id
+                    where wallets.balance <> coalesce(ledger_balances.ledger_balance, 0)
+                ) as wallet_ledger_mismatches
+            from outbox_messages;
+            """;
+
+        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken);
+        await using var command = new NpgsqlCommand(sql, connection);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        await reader.ReadAsync(cancellationToken);
+
+        return new DashboardMetricsSnapshot(
+            checked((int)reader.GetInt64(0)),
+            checked((int)reader.GetInt64(1)),
+            reader.GetDouble(2),
+            checked((int)reader.GetInt64(3)),
+            checked((int)reader.GetInt64(4)),
+            checked((int)reader.GetInt64(5)));
+    }
+
     public async Task<IReadOnlyList<OutboxMessageResponse>> GetDeadLetteredOutboxMessagesAsync(
         CancellationToken cancellationToken)
     {

@@ -30,6 +30,7 @@ IdempotentPayments.Api/
   Data/             PostgreSQL access and transaction logic
   Domain/           Payment result types
   Endpoints/        Minimal API endpoint mapping
+  Observability/    Logging, tracing, metrics, and health check support
   Services/         Application logic and request hashing
   Program.cs        App startup and dependency registration
 
@@ -272,15 +273,28 @@ OpenTelemetry exports traces and metrics to the console for local learning. Cust
 
 ```text
 payments.attempts
+idempotency.replays
+idempotency.conflicts
 wallet.debit.attempts
 consumer.events
 outbox.publish.attempts
 application.operation.duration
 outbox.pending
 outbox.dead_lettered
+outbox.oldest_pending_age
+idempotency.in_progress_stale
+wallet.negative_balance
+ledger.wallet_mismatch
 ```
 
 The metric tags intentionally use low-cardinality values such as result, currency, and event type. Identifiers such as payment ID and event ID belong in logs/traces, not metric labels.
+
+Dashboard-oriented gauges are collected from PostgreSQL every 10 seconds. These metrics focus on business and correctness signals:
+
+- `outbox.oldest_pending_age` shows whether any outbox message has been stuck too long.
+- `idempotency.in_progress_stale` shows idempotency records that may have been abandoned after a crash.
+- `wallet.negative_balance` should always be zero.
+- `ledger.wallet_mismatch` compares wallet snapshot balances against ledger-derived balances and should always be zero.
 
 Health endpoints:
 

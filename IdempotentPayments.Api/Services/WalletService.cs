@@ -73,6 +73,19 @@ public sealed class WalletService
                 new KeyValuePair<string, object?>("result", resultName),
                 new KeyValuePair<string, object?>("currency", normalizedRequest.Currency));
 
+            if (result.Kind == WalletResultKind.Replayed)
+            {
+                AppObservability.IdempotencyReplays.Add(
+                    1,
+                    new KeyValuePair<string, object?>("operation", "wallet.debit"));
+            }
+            else if (result.Kind == WalletResultKind.PayloadMismatch)
+            {
+                AppObservability.IdempotencyConflicts.Add(
+                    1,
+                    new KeyValuePair<string, object?>("operation", "wallet.debit"));
+            }
+
             if (result.Kind == WalletResultKind.Created || result.Kind == WalletResultKind.Replayed)
             {
                 _logger.LogInformation(

@@ -52,8 +52,18 @@ public sealed class PaymentService
                 new KeyValuePair<string, object?>("result", resultName),
                 new KeyValuePair<string, object?>("currency", normalizedRequest.Currency));
 
-            if (result.Kind == PaymentResultKind.PayloadMismatch)
+            if (result.Kind == PaymentResultKind.Replayed)
             {
+                AppObservability.IdempotencyReplays.Add(
+                    1,
+                    new KeyValuePair<string, object?>("operation", "payment.create"));
+            }
+            else if (result.Kind == PaymentResultKind.PayloadMismatch)
+            {
+                AppObservability.IdempotencyConflicts.Add(
+                    1,
+                    new KeyValuePair<string, object?>("operation", "payment.create"));
+
                 _logger.LogWarning(
                     "Payment request conflicted for customer {CustomerId} and idempotency key {IdempotencyKey}",
                     normalizedRequest.CustomerId,
