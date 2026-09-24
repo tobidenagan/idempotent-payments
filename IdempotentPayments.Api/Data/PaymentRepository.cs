@@ -41,6 +41,10 @@ public sealed class PaymentRepository
                 updated_at timestamptz not null default now(),
                 unique (customer_id, key)
             );
+
+            create index if not exists idempotency_in_progress_updated_at_idx
+            on idempotency_keys (updated_at)
+            where state = 'InProgress';
             """;
 
         await using var command = _dataSource.CreateCommand(sql);

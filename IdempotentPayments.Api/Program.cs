@@ -25,14 +25,17 @@ builder.Services.AddSingleton(sp =>
 builder.Services.AddSingleton<PaymentRepository>();
 builder.Services.AddSingleton<PaymentService>();
 builder.Services.AddSingleton<WalletRepository>();
+builder.Services.AddSingleton<WalletReconciliationRepository>();
 builder.Services.AddSingleton<WalletService>();
 builder.Services.AddSingleton<ConsumerRepository>();
 builder.Services.AddSingleton<ConsumerService>();
 builder.Services.AddSingleton<IOutboxTransport, LoggingOutboxTransport>();
 builder.Services.AddSingleton<OutboxMetricsState>();
 builder.Services.Configure<OutboxPublisherOptions>(builder.Configuration.GetSection("OutboxPublisher"));
+builder.Services.Configure<WalletReconciliationOptions>(builder.Configuration.GetSection("WalletReconciliation"));
 builder.Services.AddHostedService<OutboxPublisherService>();
 builder.Services.AddHostedService<OutboxMetricsCollectorService>();
+builder.Services.AddHostedService<WalletReconciliationService>();
 
 builder.Services.AddHealthChecks()
     .AddCheck("self", () => Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckResult.Healthy(), tags: new[] { "live" })
@@ -40,18 +43,31 @@ builder.Services.AddHealthChecks()
 
 builder.Services.AddOpenTelemetry()
     .ConfigureResource(resource => resource.AddService(AppObservability.ServiceName))
-    .WithTracing(tracing => tracing
-        .AddAspNetCoreInstrumentation(options =>
+    .WithTracing(tracing =>
+    {
+        tracing.AddAspNetCoreInstrumentation(options =>
         {
             options.Filter = context => !context.Request.Path.StartsWithSegments("/health");
         })
         .AddSource(AppObservability.ActivitySourceName)
-        .AddSource("Npgsql")
-        .AddConsoleExporter())
-    .WithMetrics(metrics => metrics
-        .AddAspNetCoreInstrumentation()
-        .AddMeter(AppObservability.MeterName)
-        .AddConsoleExporter());
+        .AddSource("Npgsql");
+
+        if (builder.Environment.IsDevelopment())
+        {
+            tracing.AddConsoleExporter();
+        }
+    })
+    .WithMetrics(metrics =>
+    {
+        metrics.AddAspNetCoreInstrumentation()
+            .AddMeter(AppObservability.MeterName)
+            .AddPrometheusExporter();
+
+        if (builder.Environment.IsDevelopment())
+        {
+            metrics.AddConsoleExporter();
+        }
+    });
 
 var app = builder.Build();
 
@@ -76,6 +92,7 @@ var readinessOptions = new HealthCheckOptions
 app.MapHealthChecks("/health/live", livenessOptions);
 app.MapHealthChecks("/health/ready", readinessOptions);
 app.MapHealthChecks("/health", readinessOptions);
+app.MapPrometheusScrapingEndpoint();
 
 if (app.Environment.IsDevelopment())
 {

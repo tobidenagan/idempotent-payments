@@ -4,6 +4,8 @@ A small ASP.NET Core Minimal API that demonstrates how to build a payment initia
 
 The goal of this project is educational: show the production correctness ideas behind retries, duplicate requests, database constraints, and transaction boundaries.
 
+For a candid review of what still needs work before deployment, see `PRODUCTION_READINESS.md`.
+
 ## What This Demonstrates
 
 - ASP.NET Core Minimal APIs
@@ -106,14 +108,15 @@ In Visual Studio:
 2. Right-click `docker-compose` and choose `Set as Startup Project`.
 3. Run the `Docker Compose` profile.
 
-This starts both:
+This starts:
 
 ```text
 api
 postgres
+prometheus
 ```
 
-Use `docker compose up --build` when you want the same API and PostgreSQL setup from the terminal.
+Use `docker compose up --build` when you want the same stack from the terminal.
 
 The `Docker` launch profile inside `IdempotentPayments.Api` runs only the API container. Prefer the `docker-compose` startup project when you want PostgreSQL to start automatically too.
 
@@ -269,7 +272,7 @@ Dead-lettered messages retain their payload, attempt count, last error, dead-let
 
 The API emits structured JSON logs and returns an `X-Correlation-ID` response header. Callers may supply the header; otherwise the API generates one.
 
-OpenTelemetry exports traces and metrics to the console for local learning. Custom telemetry includes:
+OpenTelemetry exports traces and metrics to the console in Development for local learning. The Prometheus metrics endpoint remains available in other environments. Custom telemetry includes:
 
 ```text
 payments.attempts
@@ -285,16 +288,69 @@ outbox.oldest_pending_age
 idempotency.in_progress_stale
 wallet.negative_balance
 ledger.wallet_mismatch
+ledger.reconciliation_last_completed
 ```
 
 The metric tags intentionally use low-cardinality values such as result, currency, and event type. Identifiers such as payment ID and event ID belong in logs/traces, not metric labels.
 
-Dashboard-oriented gauges are collected from PostgreSQL every 10 seconds. These metrics focus on business and correctness signals:
+Dashboard-oriented gauges are collected from PostgreSQL every 10 seconds. Ledger comparison runs separately in wallet batches; the dashboard query reads the last completed result. See `PRODUCTION_READINESS.md` for the remaining scale and operational gates. These metrics focus on business and correctness signals:
 
 - `outbox.oldest_pending_age` shows whether any outbox message has been stuck too long.
 - `idempotency.in_progress_stale` shows idempotency records that may have been abandoned after a crash.
-- `wallet.negative_balance` should always be zero.
-- `ledger.wallet_mismatch` compares wallet snapshot balances against ledger-derived balances and should always be zero.
+- `wallet.negative_balance` is the count from the last completed reconciliation cycle and should be zero.
+- `ledger.wallet_mismatch` is the count from the last completed reconciliation cycle and should be zero.
+- `ledger.reconciliation_last_completed` is the Unix timestamp of that cycle; zero means no cycle has completed yet.
+
+The collector also exports `dashboard_metrics.last_success`, a Unix timestamp in seconds. If its database query fails, the last gauge readings remain in memory; the timestamp exposes when those readings have become stale.
+
+### Wallet Reconciliation
+
+`WalletReconciliationService` processes at most `WalletReconciliation:BatchSize` wallets per transaction. It compares each wallet snapshot with its ledger total under PostgreSQL Repeatable Read. A transaction-scoped advisory lock prevents two app instances from advancing the same cursor concurrently. The cursor and counts live in `wallet_reconciliation_state`; a crash rolls back the current batch and another instance can resume on its next tick.
+
+Only a **completed cycle** replaces the published mismatch and negative-balance counts. Until the first completion, `ledger.reconciliation_last_completed` is zero and the freshness alert will eventually fire. A dashboard value of zero without a recent completed timestamp is not proof of correctness.
+
+The default development settings are `BatchSize=500`, `IntervalSeconds=5`, and `CommandTimeoutSeconds=10`. These are starting values, not universal production settings. A high-volume wallet can still make one batch expensive because all of that wallet's ledger entries are summed. Benchmark with realistic wallet and ledger sizes before selecting the worker cadence or the one-hour freshness alert threshold.
+
+Development startup creates the reconciliation table and indexes. Outside Development, apply `db/migrations/001_wallet_reconciliation.sql` before starting the worker. The migration uses `CREATE INDEX CONCURRENTLY`, so run it with `psql` outside an explicit transaction. For example:
+
+```powershell
+psql "$env:PAYMENTS_DATABASE_URL" -v ON_ERROR_STOP=1 -f .\db\migrations\001_wallet_reconciliation.sql
+```
+
+The worker currently runs in the API host on each instance; the advisory lock coordinates them. For a high-volume deployment, give reconciliation its own workload and database resource budget. `PRODUCTION_READINESS.md` lists the remaining release gates.
+
+### Local Alert Rules
+
+Start the API, PostgreSQL, and Prometheus together:
+
+```powershell
+docker compose up --build
+```
+
+Prometheus is available at `http://localhost:9090`. Check **Status > Targets** for the API scrape and **Alerts** for the rules in `monitoring/alerts.yml`. The API exposes metrics at `http://localhost:8080/metrics`.
+
+Visual Studio's Docker Compose startup also starts Prometheus. If the stack was already running before Prometheus was added, restart the Docker Compose startup project once to pick up the new service.
+
+If Prometheus opens but **Status > Targets** shows the API as down after you stop debugging in Visual Studio, start the Docker Compose project again. Visual Studio can leave the API container running with only its debugger helper process, so the container appears "Up" even though nothing is listening on port 8080.
+
+The example rules cover:
+
+| Signal | Condition | Severity |
+| --- | --- | --- |
+| Payment errors | More than 1% over both 5 and 30 minutes, with at least 100 eligible attempts in 30 minutes | Critical |
+| Wallet/ledger mismatch or negative wallet balance | Any affected wallet, sustained for 1 minute | Critical |
+| Wallet reconciliation freshness | No completed cycle for over 1 hour, sustained for 5 minutes | Critical |
+| Oldest pending outbox message | Over 60 seconds for 2 minutes; over 5 minutes for 1 minute | Warning; critical |
+| Dead-lettered outbox message | Any, sustained for 1 minute | Warning |
+| Stale in-progress idempotency operation | Any, sustained for 5 minutes | Warning |
+| Collector freshness | No successful database collection for over 60 seconds, sustained for 1 minute | Warning |
+| Metrics scrape | API target down for 1 minute | Warning |
+
+The payment error rule is an **approximation** of a 99.9% availability SLO. It uses `payments.attempts` with `result="Error"` over eligible service attempts, excluding idempotency payload conflicts. Validation failures never reach the service counter. A timeout before the request reaches the service is not captured, so a production customer-facing SLI also needs measurement at the entry point. The rule's 1% threshold is a 10x budget burn rate, not the 30-day SLO result.
+
+These gauges describe the shared PostgreSQL database. When scraping multiple API instances, use `max` for database-wide counts, not `sum`. The collector freshness rule evaluates each instance separately. Prometheus evaluates the rules and shows firing alerts; notifications require Alertmanager or another alerting integration. Protect `/metrics` from public access in production, for example through your reverse proxy or private network.
+
+The outbox publisher is disabled by default. If you create a wallet debit while it remains disabled, the pending-age alert will fire as designed. Enable `OutboxPublisher__Enabled=true` for the API when exercising the normal publish path.
 
 Health endpoints:
 

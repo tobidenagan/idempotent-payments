@@ -1,0 +1,104 @@
+groups:
+  - name: payment-availability
+    rules:
+      - alert: PaymentErrorsBurnBudget
+        expr: |
+          sum(rate(payments_attempts_total{result="Error"}[5m]))
+          /
+          sum(rate(payments_attempts_total{result!="PayloadMismatch"}[5m])) > 0.01
+          and
+          sum(rate(payments_attempts_total{result="Error"}[30m]))
+          /
+          sum(rate(payments_attempts_total{result!="PayloadMismatch"}[30m])) > 0.01
+          and
+          sum(increase(payments_attempts_total{result!="PayloadMismatch"}[30m])) >= 100
+        labels:
+          severity: critical
+        annotations:
+          summary: Payment errors are burning the 99.9% availability budget at over 10x
+          action: Check failing requests by time, instance, and dependency; pause risky changes while investigating.
+
+  - name: financial-correctness
+    rules:
+      - alert: WalletReconciliationStale
+        expr: time() - ledger_reconciliation_last_completed_seconds > 3600
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: No complete wallet reconciliation cycle in the last hour
+          action: Check worker progress, database query latency, and the persisted cursor before trusting ledger mismatch counts.
+
+      - alert: WalletLedgerMismatch
+        expr: max(ledger_wallet_mismatch) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Wallet balance differs from its ledger balance
+          action: Identify affected wallets and contain debits; investigate before reconciling.
+
+      - alert: NegativeWalletBalance
+        expr: max(wallet_negative_balance) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: A wallet has a negative balance
+          action: Contain affected wallet operations and investigate the balance update path.
+
+  - name: outbox-and-collector
+    rules:
+      - alert: OutboxMessageDelayed
+        expr: max(outbox_oldest_pending_age_seconds) > 60
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: An outbox message has waited over one minute
+          action: Check publisher status, retry schedule, and transport failures.
+
+      - alert: OutboxMessageStuck
+        expr: max(outbox_oldest_pending_age_seconds) > 300
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: An outbox message has waited over five minutes
+          action: Inspect the oldest message, publisher logs, retry schedule, and dead letters.
+
+      - alert: OutboxDeadLettered
+        expr: max(outbox_dead_lettered) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: At least one outbox message is dead lettered
+          action: Inspect the failure reason and replay only after fixing the cause.
+
+      - alert: StaleIdempotencyOperation
+        expr: max(idempotency_in_progress_stale) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: An idempotency operation has remained in progress for over five minutes
+          action: Inspect the affected key, transaction boundary, and recent application failures.
+
+      - alert: DashboardMetricsStale
+        expr: time() - dashboard_metrics_last_success_seconds > 60
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: Database-backed dashboard metrics have not refreshed
+          action: Check the collector logs and PostgreSQL connectivity before trusting correctness gauges.
+
+      - alert: MetricsTargetDown
+        expr: up{job="idempotent-payments"} == 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: Prometheus cannot scrape the payments API
+          action: Check the API instance and metrics endpoint.

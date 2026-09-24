@@ -27,13 +27,7 @@ public sealed class OutboxMetricsCollectorService : BackgroundService
             try
             {
                 var snapshot = await _repository.GetDashboardMetricsAsync(stoppingToken);
-                _state.Update(
-                    snapshot.PendingOutboxMessages,
-                    snapshot.DeadLetteredOutboxMessages,
-                    snapshot.OldestPendingOutboxAgeSeconds,
-                    snapshot.StaleInProgressIdempotencyKeys,
-                    snapshot.NegativeWalletBalances,
-                    snapshot.WalletLedgerMismatches);
+                _state.Update(snapshot);
             }
             catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
             {

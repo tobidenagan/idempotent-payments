@@ -1,9 +1,10 @@
 namespace IdempotentPayments.Api.Domain;
 
 public sealed record DashboardMetricsSnapshot(
-    int PendingOutboxMessages,
-    int DeadLetteredOutboxMessages,
+    long PendingOutboxMessages,
+    long DeadLetteredOutboxMessages,
     double OldestPendingOutboxAgeSeconds,
-    int StaleInProgressIdempotencyKeys,
-    int NegativeWalletBalances,
-    int WalletLedgerMismatches);
+    long StaleInProgressIdempotencyKeys,
+    long NegativeWalletBalances,
+    long WalletLedgerMismatches,
+    long ReconciliationLastCompletedUnixSeconds);

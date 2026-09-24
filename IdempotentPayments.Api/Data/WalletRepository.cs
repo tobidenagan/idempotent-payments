@@ -41,6 +41,9 @@ public sealed class WalletRepository
                 unique (wallet_id, reference, direction)
             );
 
+            create index if not exists ledger_entries_wallet_id_idx
+            on ledger_entries (wallet_id);
+
             create table if not exists outbox_messages (
                 id text primary key,
                 type text not null,
@@ -66,6 +69,29 @@ public sealed class WalletRepository
 
             alter table outbox_messages
             add column if not exists dead_letter_reason text;
+
+            create index if not exists outbox_pending_occurred_at_idx
+            on outbox_messages (occurred_at)
+            where processed_at is null and dead_lettered_at is null;
+
+            create index if not exists outbox_dead_lettered_at_idx
+            on outbox_messages (dead_lettered_at)
+            where dead_lettered_at is not null;
+
+            create table if not exists wallet_reconciliation_state (
+                id smallint primary key check (id = 1),
+                last_wallet_id text not null default '',
+                cycle_mismatches bigint not null default 0,
+                cycle_negative_balances bigint not null default 0,
+                completed_mismatches bigint not null default 0,
+                completed_negative_balances bigint not null default 0,
+                last_completed_at timestamptz,
+                cycle_started_at timestamptz not null default now()
+            );
+
+            insert into wallet_reconciliation_state (id)
+            values (1)
+            on conflict (id) do nothing;
             """;
 
         await using var command = _dataSource.CreateCommand(sql);
@@ -222,18 +248,6 @@ public sealed class WalletRepository
         CancellationToken cancellationToken)
     {
         const string sql = """
-            with ledger_balances as (
-                select
-                    wallet_id,
-                    sum(
-                        case direction
-                            when 'Credit' then amount
-                            when 'Debit' then -amount
-                        end
-                    ) as ledger_balance
-                from ledger_entries
-                group by wallet_id
-            )
             select
                 count(*) filter (
                     where processed_at is null
@@ -258,16 +272,20 @@ public sealed class WalletRepository
                       and updated_at < now() - interval '5 minutes'
                 ) as stale_in_progress_idempotency_keys,
                 (
-                    select count(*)
-                    from wallets
-                    where balance < 0
+                    select completed_negative_balances
+                    from wallet_reconciliation_state
+                    where id = 1
                 ) as negative_wallet_balances,
                 (
-                    select count(*)
-                    from wallets
-                    left join ledger_balances on ledger_balances.wallet_id = wallets.id
-                    where wallets.balance <> coalesce(ledger_balances.ledger_balance, 0)
-                ) as wallet_ledger_mismatches
+                    select completed_mismatches
+                    from wallet_reconciliation_state
+                    where id = 1
+                ) as wallet_ledger_mismatches,
+                (
+                    select coalesce(extract(epoch from last_completed_at)::bigint, 0)
+                    from wallet_reconciliation_state
+                    where id = 1
+                ) as reconciliation_last_completed_unix_seconds
             from outbox_messages;
             """;
 
@@ -277,12 +295,13 @@ public sealed class WalletRepository
         await reader.ReadAsync(cancellationToken);
 
         return new DashboardMetricsSnapshot(
-            checked((int)reader.GetInt64(0)),
-            checked((int)reader.GetInt64(1)),
+            reader.GetInt64(0),
+            reader.GetInt64(1),
             reader.GetDouble(2),
-            checked((int)reader.GetInt64(3)),
-            checked((int)reader.GetInt64(4)),
-            checked((int)reader.GetInt64(5)));
+            reader.GetInt64(3),
+            reader.GetInt64(4),
+            reader.GetInt64(5),
+            reader.GetInt64(6));
     }
 
     public async Task<IReadOnlyList<OutboxMessageResponse>> GetDeadLetteredOutboxMessagesAsync(
